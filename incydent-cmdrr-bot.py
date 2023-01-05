@@ -1,63 +1,64 @@
 import os
-import time
-
 import slack
-import pagerduty
+import pagerduty_sdk
+import opsgenie_sdk
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
-# Obtain the Slack API key and initialize the Slack client
-slack_api_key = os.environ["SLACK_API_KEY"]
-slack_client = slack.WebClient(token=slack_api_key)
+# Initialize Slack client
+slack_client = slack.WebClient(token=os.environ['SLACK_API_TOKEN'])
 
-# Obtain the PagerDuty API key and initialize the PagerDuty client
-pagerduty_api_key = os.environ["PAGERDUTY_API_KEY"]
-pagerduty_client = pagerduty.Client(auth_token=pagerduty_api_key)
+# Initialize PagerDuty client
+pagerduty_client = pagerduty_sdk.Client(api_key=os.environ['PAGERDUTY_API_KEY'])
 
-# Set up a Slack channel for incident-related messages
-incident_channel = "#incidents"
+# Initialize OpsGenie client
+opsgenie_client = opsgenie_sdk.Client(api_key=os.environ['OPSGENIE_API_KEY'])
 
-# Set up a function to send a message to the incident channel
-def send_message_to_incident_channel(message):
-    slack_client.chat_postMessage(channel=incident_channel, text=message)
+# Initialize Prometheus client
+registry = CollectorRegistry()
+incident_gauge = Gauge('incident_severity', 'Severity of incident', ['incident_id'], registry=registry)
 
-# Set up a function to create an incident in PagerDuty
-def create_incident(summary, description):
-    new_incident = pagerduty_client.incidents.create(
-        type='incident',
-        title=summary,
-        body={"type": "incident_body", "details": description}
-    )
-    return new_incident['incident']['id']
+def handle_incident(incident_id):
+  # Get incident details
+  incident = pagerduty_client.incidents.get(id=incident_id)
+  incident_summary = incident['incident']['summary']
+  incident_description = incident['incident']['description']
+  incident_severity = incident['incident']['severity']
 
-# Set up a function to resolve an incident in PagerDuty
+  # Set value for incident severity gauge
+  incident_gauge.labels(incident_id=incident_id).set(incident_severity)
+
+  # Push incident severity gauge to Prometheus gateway
+  push_to_gateway(os.environ['PROMETHEUS_GATEWAY_URL'], job='incident_severity', registry=registry)
+
+  # Send message to Slack channel
+  slack_client.chat_postMessage(
+    channel="#incidents",
+    text=f"New incident: {incident_summary}\n{incident_description}\nSeverity: {incident_severity}"
+  )
+
+  # Create alert in AlertManager
+  if incident_severity == 'critical':
+    create_alert(incident_id, incident_summary, incident_description, 'critical')
+  elif incident_severity == 'high':
+    create_alert(incident_id, incident_summary, incident_description, 'high')
+
+  # Create alert in OpsGenie
+  opsgenie_client.create_alert(
+    alias=incident_id,
+    message=incident_summary,
+    description=incident_description,
+    priority=incident_severity
+  )
+
 def resolve_incident(incident_id):
-    pagerduty_client.incidents.update(id=incident_id, status='resolved')
+  # Mark incident as resolved in PagerDuty
+  pagerduty_client.incidents.update(id=incident_id, status='resolved')
 
-# Set up a function to retrieve updates for an incident from PagerDuty
-def get_incident_updates(incident_id):
-    updates = pagerduty_client.incidents.get(id=incident_id)['incident']['notes']
-    return updates
+  # Set value for incident severity gauge to 0
+  incident_gauge.labels(incident_id=incident_id).set(0)
 
-# Set up a function to parse incident-related messages from Slack
-def parse_incident_message(message):
-    summary = message['text'].split("\n")[0]
-    description = message['text'].split("\n")[1:]
-    return summary, description
+  # Push incident severity gauge to Prometheus gateway
+  push_to_gateway(os.environ['PROMETHEUS_GATEWAY_URL'], job='incident_severity', registry=registry)
 
-# Set up a function to listen for incident-related messages in Slack
-@slack_client.on(event='message')
-def handle_incident_message(**payload):
-    event = payload['event']
-    if event['channel'] == incident_channel:
-        summary, description = parse_incident_message(event)
-        incident_id = create_incident(summary, description)
-        send_message_to_incident_channel(f"Incident {incident_id} has been created!")
-        while True:
-            time.sleep(60)  # Check for updates every minute
-            incident = pagerduty_client.incidents.get(id=incident_id)
-            if incident['incident']['status'] == 'resolved':
-                send_message_to_incident_channel(f"Incident {incident_id} has been resolved!")
-                break
-            else:
-                updates = get_incident_updates(incident_id)
-               
-
+  # Send message to Slack channel
+  slack_client.
